@@ -1,0 +1,458 @@
+-- Часть 1: Ядро состояния, настройки и безопасная очистка при перезапуске
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local CoreGui = game:GetService("CoreGui")
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then
+	return
+end
+
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+local TAG = "GakuranParrySuite"
+
+-- Снимаем старую копию артефакта перед сборкой новой
+if env[TAG] and typeof(env[TAG].Destroy) == "function" then
+	pcall(env[TAG].Destroy)
+end
+
+local CONFIG = {
+	ToggleKey = Enum.KeyCode.F,
+	ManualParryKey = Enum.KeyCode.R,
+	ParryWindow = 0.36,
+	Cooldown = 0.65,
+	ScanRadius = 20,
+	CounterImpulse = 56,
+	FovPulse = 6,
+	MinDamageThreshold = 0.5, -- Игнорируем микро-колебания здоровья ниже порога
+	ShowMobileButton = true,
+	ShowHud = true
+}
+
+local core = {
+	Config = CONFIG,
+	Enabled = true,
+	ParryWindowUntil = 0,
+	CooldownUntil = 0,
+	LastHealth = nil :: number?,
+	IsEffectRunning = false,
+	Connections = {} :: { RBXScriptConnection },
+	UiRefs = {
+		Gui = nil :: ScreenGui?,
+		StatusLabel = nil :: TextLabel?,
+		MobileButton = nil :: TextButton?
+	},
+	Hooks = {} :: { [string]: (...any) -> ...any }
+}
+
+function core.Track(conn: RBXScriptConnection): RBXScriptConnection
+	table.insert(core.Connections, conn)
+	return conn
+end
+
+function core.GetCharacterRig()
+	local character = localPlayer.Character
+	if not character then
+		return nil, nil, nil
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not humanoid or not rootPart or humanoid.Health <= 0 then
+		return nil, nil, nil
+	end
+	return character, humanoid, rootPart
+end
+
+function core.GetUiParent(): Instance
+	local container: Instance = CoreGui
+	pcall(function()
+		if typeof(gethui) == "function" then
+			local hiddenUi = gethui()
+			if typeof(hiddenUi) == "Instance" then
+				container = hiddenUi
+			end
+		end
+	end)
+	return container
+end
+
+env[TAG] = core
+-- Часть 2: Визуальные эффекты при парировании (вспышка вокруг персонажа и отклик FOV)
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+local core = env.GakuranParrySuite
+if not core then
+	return
+end
+
+local function pulseCamera(fovDelta: number)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+
+	local baseFov = camera.FieldOfView
+	local targetFov = math.clamp(baseFov - fovDelta, 40, 110)
+
+	local tweenIn = TweenService:Create(
+		camera,
+		TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ FieldOfView = targetFov }
+	)
+	local tweenOut = TweenService:Create(
+		camera,
+		TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut),
+		{ FieldOfView = baseFov }
+	)
+
+	tweenIn:Play()
+	tweenIn.Completed:Wait()
+	if workspace.CurrentCamera then
+		tweenOut:Play()
+	end
+end
+
+local function spawnRingEffect(rootPart: BasePart)
+	if core.IsEffectRunning then
+		return
+	end
+	core.IsEffectRunning = true
+
+	local ring = Instance.new("Part")
+	ring.Name = "GakuranParryAura"
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Material = Enum.Material.Neon
+	ring.Color = Color3.fromRGB(110, 225, 255)
+	ring.Anchored = true
+	ring.CanCollide = false
+	ring.Transparency = 0.2
+	ring.Size = Vector3.new(0.3, 3.5, 3.5)
+	ring.CFrame = CFrame.new(rootPart.Position - Vector3.new(0, 1.5, 0)) * CFrame.Angles(0, 0, math.rad(90))
+	ring.Parent = workspace
+
+	local tween = TweenService:Create(
+		ring,
+		TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+		{
+			Size = Vector3.new(0.08, 13, 13),
+			Transparency = 1
+		}
+	)
+	tween:Play()
+	tween.Completed:Connect(function()
+		ring:Destroy()
+		core.IsEffectRunning = false
+	end)
+end
+
+core.Hooks.PlayParryVisuals = function(rootPart: BasePart)
+	task.spawn(spawnRingEffect, rootPart)
+	task.spawn(pulseCamera, core.Config.FovPulse)
+end
+-- Часть 3: Перехват урона, окно парирования, восстановление HP и отталкивание цели
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+local core = env.GakuranParrySuite
+if not core then
+	return
+end
+
+local function pushNearestThreat(rootPart: BasePart)
+	local nearestRoot: BasePart? = nil
+	local bestDistance = core.Config.ScanRadius
+
+	for _, obj in ipairs(workspace:GetChildren()) do
+		if obj:IsA("Model") and obj ~= Players.LocalPlayer.Character then
+			local hum = obj:FindFirstChildOfClass("Humanoid")
+			local targetRoot = obj:FindFirstChild("HumanoidRootPart") :: BasePart?
+			if hum and hum.Health > 0 and targetRoot then
+				local dist = (targetRoot.Position - rootPart.Position).Magnitude
+				if dist < bestDistance then
+					bestDistance = dist
+					nearestRoot = targetRoot
+				end
+			end
+		end
+	end
+
+	if nearestRoot then
+		local delta = nearestRoot.Position - rootPart.Position
+		local flat = Vector3.new(delta.X, 0, delta.Z)
+		if flat.Magnitude > 0.05 then
+			pcall(function()
+				nearestRoot.AssemblyLinearVelocity = flat.Unit * core.Config.CounterImpulse + Vector3.new(0, 15, 0)
+			end)
+		end
+	end
+end
+
+core.Hooks.RefreshHud = function()
+	local label = core.UiRefs.StatusLabel
+	local btn = core.UiRefs.MobileButton
+	local now = os.clock()
+
+	if label then
+		if not core.Enabled then
+			label.Text = "PARRY: OFF"
+			label.TextColor3 = Color3.fromRGB(255, 115, 115)
+		elseif now < core.CooldownUntil then
+			label.Text = string.format("CD: %.1fs", core.CooldownUntil - now)
+			label.TextColor3 = Color3.fromRGB(255, 210, 95)
+		elseif now <= core.ParryWindowUntil then
+			label.Text = "PARRY: WINDOW"
+			label.TextColor3 = Color3.fromRGB(115, 255, 185)
+		else
+			label.Text = "PARRY: AUTO ON"
+			label.TextColor3 = Color3.fromRGB(125, 225, 255)
+		end
+	end
+
+	if btn then
+		btn.BackgroundColor3 = core.Enabled
+			and Color3.fromRGB(30, 48, 76)
+			or Color3.fromRGB(70, 32, 36)
+	end
+end
+
+core.Hooks.ArmParry = function(duration: number?)
+	if not core.Enabled then
+		return false
+	end
+	local now = os.clock()
+	if now < core.CooldownUntil then
+		return false
+	end
+	core.ParryWindowUntil = math.max(core.ParryWindowUntil, now + (duration or core.Config.ParryWindow))
+	if core.Hooks.RefreshHud then
+		core.Hooks.RefreshHud()
+	end
+	return true
+end
+
+core.Hooks.Toggle = function()
+	core.Enabled = not core.Enabled
+	if not core.Enabled then
+		core.ParryWindowUntil = 0
+	end
+	if core.Hooks.RefreshHud then
+		core.Hooks.RefreshHud()
+	end
+end
+
+local function executeParry(humanoid: Humanoid, rootPart: BasePart, recoveredHp: number)
+	local now = os.clock()
+	core.ParryWindowUntil = 0
+	core.CooldownUntil = now + core.Config.Cooldown
+
+	if recoveredHp > 0 then
+		humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + recoveredHp)
+	end
+	core.LastHealth = humanoid.Health
+
+	pushNearestThreat(rootPart)
+	if core.Hooks.PlayParryVisuals then
+		core.Hooks.PlayParryVisuals(rootPart)
+	end
+	if core.Hooks.RefreshHud then
+		core.Hooks.RefreshHud()
+	end
+end
+
+core.Hooks.BindCharacter = function(character: Model)
+	local humanoid = character:WaitForChild("Humanoid", 10) :: Humanoid?
+	if not humanoid then
+		return
+	end
+
+	core.LastHealth = humanoid.Health
+
+	core.Track(humanoid.HealthChanged:Connect(function(newHealth: number)
+		local prev = core.LastHealth or newHealth
+		core.LastHealth = newHealth
+
+		local lost = prev - newHealth
+		if lost < core.Config.MinDamageThreshold or newHealth <= 0 or not core.Enabled then
+			return
+		end
+
+		local _, _, rootPart = core.GetCharacterRig()
+		if not rootPart then
+			return
+		end
+
+		local now = os.clock()
+		if now >= core.CooldownUntil then
+			if now > core.ParryWindowUntil then
+				core.ParryWindowUntil = now + core.Config.ParryWindow
+			end
+			if os.clock() <= core.ParryWindowUntil then
+				executeParry(humanoid, rootPart, lost)
+			end
+		end
+	end))
+end
+-- Часть 4: Экранный UI для мобильных устройств, бинды клавиш/касаний и запуск
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+local core = env.GakuranParrySuite
+if not core then
+	return
+end
+
+local function buildUi()
+	local parent = core.GetUiParent()
+	local old = parent:FindFirstChild("GakuranParrySuite_Gui")
+	if old then
+		old:Destroy()
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "GakuranParrySuite_Gui"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = parent
+	core.UiRefs.Gui = gui
+
+	if core.Config.ShowHud then
+		local badge = Instance.new("TextLabel")
+		badge.Name = "StatusBadge"
+		badge.Size = UDim2.fromOffset(152, 28)
+		badge.Position = UDim2.new(0.5, -76, 0, 12)
+		badge.BackgroundColor3 = Color3.fromRGB(18, 24, 36)
+		badge.BackgroundTransparency = 0.18
+		badge.BorderSizePixel = 0
+		badge.Font = Enum.Font.GothamBold
+		badge.TextSize = 13
+		badge.TextColor3 = Color3.fromRGB(125, 225, 255)
+		badge.Text = "PARRY: AUTO ON"
+		badge.Parent = gui
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 8)
+		corner.Parent = badge
+
+		core.UiRefs.StatusLabel = badge
+	end
+
+	if core.Config.ShowMobileButton then
+		local btn = Instance.new("TextButton")
+		btn.Name = "MobileParryButton"
+		btn.Size = UDim2.fromOffset(118, 48)
+		btn.Position = UDim2.new(1, -138, 0.62, 0)
+		btn.BackgroundColor3 = Color3.fromRGB(30, 48, 76)
+		btn.BackgroundTransparency = 0.1
+		btn.BorderSizePixel = 0
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 13
+		btn.TextColor3 = Color3.fromRGB(240, 248, 255)
+		btn.Text = "AUTO PARRY"
+		btn.Active = true
+		btn.Parent = gui
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 12)
+		corner.Parent = btn
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Color3.fromRGB(115, 225, 255)
+		stroke.Thickness = 1.5
+		stroke.Transparency = 0.3
+		stroke.Parent = btn
+
+		core.Track(btn.MouseButton1Click:Connect(function()
+			if core.Hooks.Toggle then
+				core.Hooks.Toggle()
+			end
+		end))
+
+		core.Track(btn.TouchTap:Connect(function()
+			if core.Hooks.Toggle then
+				core.Hooks.Toggle()
+			end
+		end))
+
+		core.UiRefs.MobileButton = btn
+	end
+end
+
+pcall(function()
+	ContextActionService:BindAction(
+		"GakuranSuiteToggle",
+		function(_, state: Enum.UserInputState)
+			if state == Enum.UserInputState.Begin and core.Hooks.Toggle then
+				core.Hooks.Toggle()
+			end
+		end,
+		false,
+		core.Config.ToggleKey
+	)
+
+	ContextActionService:BindAction(
+		"GakuranSuiteManualWindow",
+		function(_, state: Enum.UserInputState)
+			if state == Enum.UserInputState.Begin and core.Hooks.ArmParry then
+				core.Hooks.ArmParry(core.Config.ParryWindow)
+			end
+		end,
+		false,
+		core.Config.ManualParryKey
+	)
+end)
+
+core.Track(UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
+	if processed then
+		return
+	end
+	if input.KeyCode == core.Config.ToggleKey and core.Hooks.Toggle then
+		core.Hooks.Toggle()
+	elseif input.KeyCode == core.Config.ManualParryKey and core.Hooks.ArmParry then
+		core.Hooks.ArmParry(core.Config.ParryWindow)
+	end
+end))
+
+local lastHudTick = 0
+core.Track(RunService.RenderStepped:Connect(function()
+	local now = os.clock()
+	if now - lastHudTick >= 0.08 then
+		lastHudTick = now
+		if core.Hooks.RefreshHud then
+			core.Hooks.RefreshHud()
+		end
+	end
+end))
+
+if Players.LocalPlayer.Character and core.Hooks.BindCharacter then
+	task.spawn(core.Hooks.BindCharacter, Players.LocalPlayer.Character)
+end
+
+core.Track(Players.LocalPlayer.CharacterAdded:Connect(function(char: Model)
+	if core.Hooks.BindCharacter then
+		core.Hooks.BindCharacter(char)
+	end
+end))
+
+core.Destroy = function()
+	for _, conn in ipairs(core.Connections) do
+		pcall(function()
+			conn:Disconnect()
+		end)
+	end
+	table.clear(core.Connections)
+
+	pcall(function()
+		ContextActionService:UnbindAction("GakuranSuiteToggle")
+		ContextActionService:UnbindAction("GakuranSuiteManualWindow")
+	end)
+
+	if core.UiRefs.Gui then
+		pcall(function()
+			core.UiRefs.Gui:Destroy()
+		end)
+		core.UiRefs.Gui = nil
+	end
+end
+
+buildUi()
+if core.Hooks.RefreshHud then
+	core.Hooks.RefreshHud()
+end
