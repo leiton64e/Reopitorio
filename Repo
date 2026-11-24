@@ -1,9 +1,8 @@
--- Часть 1: Ядро состояния, настройки и безопасная очистка при перезапуске
+-- [01] NÚCLEO: Servicios, configuración, estado compartido y limpieza segura
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local ContextActionService = game:GetService("ContextActionService")
 local CoreGui = game:GetService("CoreGui")
 
 local localPlayer = Players.LocalPlayer
@@ -12,447 +11,880 @@ if not localPlayer then
 end
 
 local env = (typeof(getgenv) == "function" and getgenv()) or _G
-local TAG = "GakuranParrySuite"
+local SUITE_KEY = "GakuranMasterSuite_v12"
 
--- Снимаем старую копию артефакта перед сборкой новой
-if env[TAG] and typeof(env[TAG].Destroy) == "function" then
-	pcall(env[TAG].Destroy)
+-- Evita duplicados si el pergamino se ejecuta más de una vez
+if env[SUITE_KEY] and typeof(env[SUITE_KEY].Cleanup) == "function" then
+	pcall(env[SUITE_KEY].Cleanup)
 end
 
 local CONFIG = {
-	ToggleKey = Enum.KeyCode.F,
-	ManualParryKey = Enum.KeyCode.R,
-	ParryWindow = 0.36,
-	Cooldown = 0.65,
-	ScanRadius = 20,
-	CounterImpulse = 56,
-	FovPulse = 6,
-	MinDamageThreshold = 0.5, -- Игнорируем микро-колебания здоровья ниже порога
-	ShowMobileButton = true,
-	ShowHud = true
+	-- Estados iniciales
+	AutoGuardEnabled = true,
+	EspEnabled = true,
+	TargetFilter = "ALL", -- "ALL" | "PLR" | "NPC"
+
+	-- Atajos de teclado (en táctil se usan los botones del HUD)
+	ToggleGuardKey = Enum.KeyCode.F,
+	ToggleEspKey = Enum.KeyCode.G,
+	CycleFilterKey = Enum.KeyCode.H,
+
+	-- Tiempos de defensa y autoparry
+	ParryWindow = 0.45,
+	BlockDuration = 0.70,
+	Cooldown = 0.48,
+	MinDamageThreshold = 0.4,
+
+	-- Detección y respuesta ante amenazas
+	ThreatRadius = 26,
+	ThreatApproachSpeed = 13,
+	CounterImpulse = 64,
+	FovPulse = 7,
+
+	-- Parámetros del ESP y rendimiento
+	EspMaxDistance = 450,
+	ShowHighlight = true,
+	ScanInterval = 0.06,
+	EspInterval = 0.12,
+	HudInterval = 0.07
 }
 
-local core = {
+local suite = {
 	Config = CONFIG,
-	Enabled = true,
+	AutoGuardEnabled = CONFIG.AutoGuardEnabled,
+	EspEnabled = CONFIG.EspEnabled,
+	TargetFilter = CONFIG.TargetFilter,
+
+	IsBlocking = false,
+	BlockUntil = 0,
 	ParryWindowUntil = 0,
 	CooldownUntil = 0,
+
 	LastHealth = nil :: number?,
-	IsEffectRunning = false,
+	ParryCount = 0,
+	BlockCount = 0,
+	LastEvent = "Suite Optimizada Lista",
+	AnimBusy = false,
+
 	Connections = {} :: { RBXScriptConnection },
-	UiRefs = {
-		Gui = nil :: ScreenGui?,
-		StatusLabel = nil :: TextLabel?,
-		MobileButton = nil :: TextButton?
-	},
-	Hooks = {} :: { [string]: (...any) -> ...any }
+	EspMap = {} :: { [Model]: {
+		billboard: BillboardGui,
+		highlight: Highlight?,
+		nameLabel: TextLabel,
+		hpLabel: TextLabel,
+		barFill: Frame
+	} },
+	ShieldPart = nil :: Part?,
+	Gui = nil :: ScreenGui?,
+	HudRefs = {} :: { [string]: GuiObject },
+	Api = {} :: { [string]: (...any) -> ...any }
 }
 
-function core.Track(conn: RBXScriptConnection): RBXScriptConnection
-	table.insert(core.Connections, conn)
+function suite.Track(conn: RBXScriptConnection): RBXScriptConnection
+	table.insert(suite.Connections, conn)
 	return conn
 end
 
-function core.GetCharacterRig()
-	local character = localPlayer.Character
-	if not character then
-		return nil, nil, nil
-	end
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	local rootPart = character:FindFirstChild("HumanoidRootPart") :: BasePart?
-	if not humanoid or not rootPart or humanoid.Health <= 0 then
-		return nil, nil, nil
-	end
-	return character, humanoid, rootPart
-end
-
-function core.GetUiParent(): Instance
-	local container: Instance = CoreGui
+function suite.GetUiRoot(): Instance
+	local root: Instance = CoreGui
 	pcall(function()
 		if typeof(gethui) == "function" then
-			local hiddenUi = gethui()
-			if typeof(hiddenUi) == "Instance" then
-				container = hiddenUi
+			local custom = gethui()
+			if typeof(custom) == "Instance" then
+				root = custom
 			end
 		end
 	end)
-	return container
+	return root
 end
 
-env[TAG] = core
--- Часть 2: Визуальные эффекты при парировании (вспышка вокруг персонажа и отклик FOV)
+function suite.GetLordRig()
+	local char = localPlayer.Character
+	if not char then
+		return nil, nil, nil
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = (char:FindFirstChild("HumanoidRootPart") :: BasePart?) or (char.PrimaryPart :: BasePart?)
+	if not hum or not root or hum.Health <= 0 then
+		return nil, nil, nil
+	end
+	return char, hum, root
+end
+
+env[SUITE_KEY] = suite
+-- [02] ESCÁNER: Recolecta jugadores y NPCs válidos (incluso dentro de carpetas)
 local env = (typeof(getgenv) == "function" and getgenv()) or _G
-local core = env.GakuranParrySuite
-if not core then
+local suite = env.GakuranMasterSuite_v12
+if not suite then
 	return
 end
 
-local function pulseCamera(fovDelta: number)
-	local camera = workspace.CurrentCamera
-	if not camera then
-		return
-	end
+export type TargetEntity = {
+	model: Model,
+	humanoid: Humanoid,
+	root: BasePart,
+	adornee: BasePart,
+	isPlayer: boolean
+}
 
-	local baseFov = camera.FieldOfView
-	local targetFov = math.clamp(baseFov - fovDelta, 40, 110)
-
-	local tweenIn = TweenService:Create(
-		camera,
-		TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ FieldOfView = targetFov }
-	)
-	local tweenOut = TweenService:Create(
-		camera,
-		TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut),
-		{ FieldOfView = baseFov }
-	)
-
-	tweenIn:Play()
-	tweenIn.Completed:Wait()
-	if workspace.CurrentCamera then
-		tweenOut:Play()
-	end
+local function resolveBodyParts(model: Model): (BasePart?, BasePart?)
+	local root = (model:FindFirstChild("HumanoidRootPart") :: BasePart?)
+		or (model.PrimaryPart :: BasePart?)
+		or (model:FindFirstChildWhichIsA("BasePart") :: BasePart?)
+	local head = (model:FindFirstChild("Head") :: BasePart?) or root
+	return root, head
 end
 
-local function spawnRingEffect(rootPart: BasePart)
-	if core.IsEffectRunning then
-		return
-	end
-	core.IsEffectRunning = true
+function suite.Api.GetTargets(filterMode: string?): { TargetEntity }
+	local mode = filterMode or suite.TargetFilter
+	local lordChar = localPlayer.Character
+	local results = {} :: { TargetEntity }
+	local visited = {} :: { [Model]: boolean }
 
-	local ring = Instance.new("Part")
-	ring.Name = "GakuranParryAura"
-	ring.Shape = Enum.PartType.Cylinder
-	ring.Material = Enum.Material.Neon
-	ring.Color = Color3.fromRGB(110, 225, 255)
-	ring.Anchored = true
-	ring.CanCollide = false
-	ring.Transparency = 0.2
-	ring.Size = Vector3.new(0.3, 3.5, 3.5)
-	ring.CFrame = CFrame.new(rootPart.Position - Vector3.new(0, 1.5, 0)) * CFrame.Angles(0, 0, math.rad(90))
-	ring.Parent = workspace
-
-	local tween = TweenService:Create(
-		ring,
-		TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
-		{
-			Size = Vector3.new(0.08, 13, 13),
-			Transparency = 1
-		}
-	)
-	tween:Play()
-	tween.Completed:Connect(function()
-		ring:Destroy()
-		core.IsEffectRunning = false
-	end)
-end
-
-core.Hooks.PlayParryVisuals = function(rootPart: BasePart)
-	task.spawn(spawnRingEffect, rootPart)
-	task.spawn(pulseCamera, core.Config.FovPulse)
-end
--- Часть 3: Перехват урона, окно парирования, восстановление HP и отталкивание цели
-local env = (typeof(getgenv) == "function" and getgenv()) or _G
-local core = env.GakuranParrySuite
-if not core then
-	return
-end
-
-local function pushNearestThreat(rootPart: BasePart)
-	local nearestRoot: BasePart? = nil
-	local bestDistance = core.Config.ScanRadius
-
-	for _, obj in ipairs(workspace:GetChildren()) do
-		if obj:IsA("Model") and obj ~= Players.LocalPlayer.Character then
-			local hum = obj:FindFirstChildOfClass("Humanoid")
-			local targetRoot = obj:FindFirstChild("HumanoidRootPart") :: BasePart?
-			if hum and hum.Health > 0 and targetRoot then
-				local dist = (targetRoot.Position - rootPart.Position).Magnitude
-				if dist < bestDistance then
-					bestDistance = dist
-					nearestRoot = targetRoot
+	-- 1) Jugadores en el servidor
+	if mode == "ALL" or mode == "PLR" then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= localPlayer and plr.Character and not visited[plr.Character] then
+				local char = plr.Character
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				local root, head = resolveBodyParts(char)
+				if hum and hum.Health > 0 and hum.MaxHealth > 0 and root and head then
+					visited[char] = true
+					table.insert(results, {
+						model = char,
+						humanoid = hum,
+						root = root,
+						adornee = head,
+						isPlayer = true
+					})
 				end
 			end
 		end
 	end
 
-	if nearestRoot then
-		local delta = nearestRoot.Position - rootPart.Position
-		local flat = Vector3.new(delta.X, 0, delta.Z)
+	-- 2) NPCs con Humanoid en cualquier carpeta de workspace
+	if mode == "ALL" or mode == "NPC" then
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			if inst:IsA("Humanoid") and inst.Health > 0 and inst.MaxHealth > 0 then
+				local model = inst.Parent
+				if model and model:IsA("Model") and model ~= lordChar and not visited[model] then
+					if Players:GetPlayerFromCharacter(model) == nil then
+						local root, head = resolveBodyParts(model)
+						if root and head then
+							visited[model] = true
+							table.insert(results, {
+								model = model,
+								humanoid = inst,
+								root = root,
+								adornee = head,
+								isPlayer = false
+							})
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return results
+end
+-- [03] DEFENSA: Bloqueo automático ante amenazas al Lord + autoparry con recuperación
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+local suite = env.GakuranMasterSuite_v12
+if not suite or not suite.Api.GetTargets then
+	return
+end
+
+local function clearShield()
+	if suite.ShieldPart then
+		pcall(function()
+			suite.ShieldPart:Destroy()
+		end)
+		suite.ShieldPart = nil
+	end
+end
+
+function suite.Api.SyncShield(rootPart: BasePart?)
+	if not suite.IsBlocking or not rootPart then
+		clearShield()
+		return
+	end
+
+	local shield = suite.ShieldPart
+	if not shield or not shield.Parent then
+		shield = Instance.new("Part")
+		shield.Name = "GakuranLordShield"
+		shield.Shape = Enum.PartType.Block
+		shield.Material = Enum.Material.ForceField
+		shield.Color = Color3.fromRGB(90, 215, 255)
+		shield.Anchored = true
+		shield.CanCollide = false
+		shield.Transparency = 0.35
+		shield.Size = Vector3.new(5.6, 5.6, 0.7)
+		shield.Parent = workspace
+		suite.ShieldPart = shield
+	end
+
+	local lookFlat = Vector3.new(rootPart.CFrame.LookVector.X, 0, rootPart.CFrame.LookVector.Z)
+	local dir = lookFlat.Magnitude > 0.01 and lookFlat.Unit or Vector3.new(0, 0, -1)
+	local frontPos = rootPart.Position + dir * 2.85
+	shield.CFrame = CFrame.lookAt(frontPos, frontPos + dir)
+end
+
+local function playParryFeedback(rootPart: BasePart)
+	if suite.AnimBusy then
+		return
+	end
+	suite.AnimBusy = true
+
+	local ring = Instance.new("Part")
+	ring.Name = "GakuranParryRing"
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Material = Enum.Material.Neon
+	ring.Color = Color3.fromRGB(120, 235, 255)
+	ring.Anchored = true
+	ring.CanCollide = false
+	ring.Transparency = 0.2
+	ring.Size = Vector3.new(0.25, 3.5, 3.5)
+	ring.CFrame = CFrame.new(rootPart.Position - Vector3.new(0, 1.4, 0)) * CFrame.Angles(0, 0, math.rad(90))
+	ring.Parent = workspace
+
+	local tween = TweenService:Create(
+		ring,
+		TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+		{ Size = Vector3.new(0.08, 14, 14), Transparency = 1 }
+	)
+	tween:Play()
+	tween.Completed:Connect(function()
+		ring:Destroy()
+		suite.AnimBusy = false
+	end)
+
+	local cam = workspace.CurrentCamera
+	if cam then
+		local baseFov = cam.FieldOfView
+		local peakFov = math.clamp(baseFov - suite.Config.FovPulse, 40, 110)
+		local t1 = TweenService:Create(cam, TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { FieldOfView = peakFov })
+		local t2 = TweenService:Create(cam, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), { FieldOfView = baseFov })
+		t1:Play()
+		t1.Completed:Wait()
+		if workspace.CurrentCamera then
+			t2:Play()
+		end
+	end
+end
+
+local function faceAndRepelThreat(rootPart: BasePart, preferredTarget: BasePart?)
+	local chosen = preferredTarget
+	if not chosen then
+		local bestDist = suite.Config.ThreatRadius
+		for _, t in ipairs(suite.Api.GetTargets("ALL")) do
+			local d = (t.root.Position - rootPart.Position).Magnitude
+			if d < bestDist then
+				bestDist = d
+				chosen = t.root
+			end
+		end
+	end
+
+	if chosen then
+		local flat = Vector3.new(chosen.Position.X - rootPart.Position.X, 0, chosen.Position.Z - rootPart.Position.Z)
 		if flat.Magnitude > 0.05 then
+			local unit = flat.Unit
 			pcall(function()
-				nearestRoot.AssemblyLinearVelocity = flat.Unit * core.Config.CounterImpulse + Vector3.new(0, 15, 0)
+				rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + unit)
+				chosen.AssemblyLinearVelocity = unit * suite.Config.CounterImpulse + Vector3.new(0, 15, 0)
 			end)
 		end
 	end
 end
 
-core.Hooks.RefreshHud = function()
-	local label = core.UiRefs.StatusLabel
-	local btn = core.UiRefs.MobileButton
+local function raiseAutoBlock(rootPart: BasePart, attackerRoot: BasePart?, statusText: string)
+	if not suite.AutoGuardEnabled then
+		return
+	end
 	local now = os.clock()
+	local wasUp = suite.IsBlocking
+	suite.IsBlocking = true
+	suite.BlockUntil = math.max(suite.BlockUntil, now + suite.Config.BlockDuration)
+	suite.ParryWindowUntil = math.max(suite.ParryWindowUntil, now + suite.Config.ParryWindow)
 
-	if label then
-		if not core.Enabled then
-			label.Text = "PARRY: OFF"
-			label.TextColor3 = Color3.fromRGB(255, 115, 115)
-		elseif now < core.CooldownUntil then
-			label.Text = string.format("CD: %.1fs", core.CooldownUntil - now)
-			label.TextColor3 = Color3.fromRGB(255, 210, 95)
-		elseif now <= core.ParryWindowUntil then
-			label.Text = "PARRY: WINDOW"
-			label.TextColor3 = Color3.fromRGB(115, 255, 185)
-		else
-			label.Text = "PARRY: AUTO ON"
-			label.TextColor3 = Color3.fromRGB(125, 225, 255)
-		end
+	if not wasUp then
+		suite.BlockCount += 1
 	end
 
-	if btn then
-		btn.BackgroundColor3 = core.Enabled
-			and Color3.fromRGB(30, 48, 76)
-			or Color3.fromRGB(70, 32, 36)
+	suite.LastEvent = statusText
+	faceAndRepelThreat(rootPart, attackerRoot)
+	suite.Api.SyncShield(rootPart)
+	if suite.Api.RefreshHud then
+		suite.Api.RefreshHud()
 	end
 end
 
-core.Hooks.ArmParry = function(duration: number?)
-	if not core.Enabled then
-		return false
-	end
+local function performAutoParry(humanoid: Humanoid, rootPart: BasePart, recoveredHp: number)
 	local now = os.clock()
-	if now < core.CooldownUntil then
-		return false
-	end
-	core.ParryWindowUntil = math.max(core.ParryWindowUntil, now + (duration or core.Config.ParryWindow))
-	if core.Hooks.RefreshHud then
-		core.Hooks.RefreshHud()
-	end
-	return true
-end
-
-core.Hooks.Toggle = function()
-	core.Enabled = not core.Enabled
-	if not core.Enabled then
-		core.ParryWindowUntil = 0
-	end
-	if core.Hooks.RefreshHud then
-		core.Hooks.RefreshHud()
-	end
-end
-
-local function executeParry(humanoid: Humanoid, rootPart: BasePart, recoveredHp: number)
-	local now = os.clock()
-	core.ParryWindowUntil = 0
-	core.CooldownUntil = now + core.Config.Cooldown
+	suite.ParryWindowUntil = 0
+	suite.CooldownUntil = now + suite.Config.Cooldown
+	suite.IsBlocking = true
+	suite.BlockUntil = math.max(suite.BlockUntil, now + suite.Config.BlockDuration)
+	suite.ParryCount += 1
+	suite.LastEvent = string.format("¡Parry #%d! (+%.0f HP)", suite.ParryCount, recoveredHp)
 
 	if recoveredHp > 0 then
 		humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + recoveredHp)
 	end
-	core.LastHealth = humanoid.Health
+	suite.LastHealth = humanoid.Health
 
-	pushNearestThreat(rootPart)
-	if core.Hooks.PlayParryVisuals then
-		core.Hooks.PlayParryVisuals(rootPart)
-	end
-	if core.Hooks.RefreshHud then
-		core.Hooks.RefreshHud()
+	faceAndRepelThreat(rootPart, nil)
+	task.spawn(playParryFeedback, rootPart)
+	suite.Api.SyncShield(rootPart)
+	if suite.Api.RefreshHud then
+		suite.Api.RefreshHud()
 	end
 end
 
-core.Hooks.BindCharacter = function(character: Model)
+function suite.Api.ScanAndDefendLord()
+	if not suite.AutoGuardEnabled then
+		return
+	end
+	local _, humanoid, rootPart = suite.GetLordRig()
+	if not humanoid or not rootPart then
+		return
+	end
+
+	local now = os.clock()
+	if now < suite.CooldownUntil then
+		return
+	end
+
+	for _, t in ipairs(suite.Api.GetTargets("ALL")) do
+		local toLord = rootPart.Position - t.root.Position
+		local dist = toLord.Magnitude
+		if dist <= suite.Config.ThreatRadius and dist > 0.01 then
+			local dir = toLord.Unit
+			local approachSpeed = t.root.AssemblyLinearVelocity:Dot(dir)
+			local aimingAtLord = t.root.CFrame.LookVector:Dot(dir) > 0.50
+
+			if (approachSpeed >= suite.Config.ThreatApproachSpeed and dist <= 16) or (aimingAtLord and dist <= 10) then
+				local label = t.isPlayer and "Jugador" or "NPC"
+				raiseAutoBlock(rootPart, t.root, string.format("Bloqueo vs %s (%s)", t.model.Name, label))
+				break
+			end
+		end
+	end
+end
+
+function suite.Api.BindLord(character: Model)
 	local humanoid = character:WaitForChild("Humanoid", 10) :: Humanoid?
 	if not humanoid then
 		return
 	end
 
-	core.LastHealth = humanoid.Health
+	suite.LastHealth = humanoid.Health
 
-	core.Track(humanoid.HealthChanged:Connect(function(newHealth: number)
-		local prev = core.LastHealth or newHealth
-		core.LastHealth = newHealth
+	suite.Track(humanoid.HealthChanged:Connect(function(newHp: number)
+		local prevHp = suite.LastHealth or newHp
+		suite.LastHealth = newHp
 
-		local lost = prev - newHealth
-		if lost < core.Config.MinDamageThreshold or newHealth <= 0 or not core.Enabled then
+		local lost = prevHp - newHp
+		if lost < suite.Config.MinDamageThreshold or newHp <= 0 or not suite.AutoGuardEnabled then
 			return
 		end
 
-		local _, _, rootPart = core.GetCharacterRig()
+		local _, _, rootPart = suite.GetLordRig()
 		if not rootPart then
 			return
 		end
 
-		local now = os.clock()
-		if now >= core.CooldownUntil then
-			if now > core.ParryWindowUntil then
-				core.ParryWindowUntil = now + core.Config.ParryWindow
-			end
-			if os.clock() <= core.ParryWindowUntil then
-				executeParry(humanoid, rootPart, lost)
-			end
+		if os.clock() >= suite.CooldownUntil then
+			performAutoParry(humanoid, rootPart, lost)
+		else
+			raiseAutoBlock(rootPart, nil, "Bloqueo de emergencia")
 		end
 	end))
 end
--- Часть 4: Экранный UI для мобильных устройств, бинды клавиш/касаний и запуск
+
+suite.Api.ClearShield = clearShield
+-- [04] ESP: Etiquetas flotantes con barra de vida, HP, distancia y resaltado
 local env = (typeof(getgenv) == "function" and getgenv()) or _G
-local core = env.GakuranParrySuite
-if not core then
+local suite = env.GakuranMasterSuite_v12
+if not suite or not suite.Api.GetTargets then
 	return
 end
 
-local function buildUi()
-	local parent = core.GetUiParent()
-	local old = parent:FindFirstChild("GakuranParrySuite_Gui")
-	if old then
-		old:Destroy()
+local function removeEsp(model: Model)
+	local entry = suite.EspMap[model]
+	if entry then
+		pcall(function()
+			entry.billboard:Destroy()
+		end)
+		if entry.highlight then
+			pcall(function()
+				entry.highlight:Destroy()
+			end)
+		end
+		suite.EspMap[model] = nil
+	end
+end
+
+function suite.Api.ClearAllEsp()
+	for model in pairs(suite.EspMap) do
+		removeEsp(model)
+	end
+end
+
+local function createEsp(model: Model, adornee: BasePart, isPlayer: boolean)
+	local accent = isPlayer and Color3.fromRGB(255, 110, 110) or Color3.fromRGB(255, 190, 85)
+	local uiRoot = suite.GetUiRoot()
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "GakuranEspBillboard"
+	billboard.Adornee = adornee
+	billboard.Size = UDim2.fromOffset(156, 46)
+	billboard.StudsOffset = Vector3.new(0, 3.2, 0)
+	billboard.AlwaysOnTop = true
+	billboard.MaxDistance = suite.Config.EspMaxDistance
+	billboard.Parent = uiRoot
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.fromScale(1, 1)
+	frame.BackgroundColor3 = Color3.fromRGB(14, 19, 29)
+	frame.BackgroundTransparency = 0.22
+	frame.BorderSizePixel = 0
+	frame.Parent = billboard
+
+	local fCorner = Instance.new("UICorner")
+	fCorner.CornerRadius = UDim.new(0, 8)
+	fCorner.Parent = frame
+
+	local fStroke = Instance.new("UIStroke")
+	fStroke.Color = accent
+	fStroke.Thickness = 1.2
+	fStroke.Transparency = 0.3
+	fStroke.Parent = frame
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Size = UDim2.new(1, -10, 0, 16)
+	nameLabel.Position = UDim2.fromOffset(5, 2)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextSize = 11
+	nameLabel.TextColor3 = Color3.fromRGB(245, 250, 255)
+	nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLabel.Text = model.Name
+	nameLabel.Parent = frame
+
+	local hpLabel = Instance.new("TextLabel")
+	hpLabel.Size = UDim2.new(1, -10, 0, 13)
+	hpLabel.Position = UDim2.fromOffset(5, 16)
+	hpLabel.BackgroundTransparency = 1
+	hpLabel.Font = Enum.Font.GothamSemibold
+	hpLabel.TextSize = 10
+	hpLabel.TextColor3 = Color3.fromRGB(170, 255, 190)
+	hpLabel.Text = "100 / 100 HP"
+	hpLabel.Parent = frame
+
+	local barBg = Instance.new("Frame")
+	barBg.Size = UDim2.new(1, -12, 0, 8)
+	barBg.Position = UDim2.fromOffset(6, 32)
+	barBg.BackgroundColor3 = Color3.fromRGB(38, 44, 56)
+	barBg.BorderSizePixel = 0
+	barBg.Parent = frame
+
+	local bgCorner = Instance.new("UICorner")
+	bgCorner.CornerRadius = UDim.new(1, 0)
+	bgCorner.Parent = barBg
+
+	local barFill = Instance.new("Frame")
+	barFill.Size = UDim2.fromScale(1, 1)
+	barFill.BackgroundColor3 = Color3.fromRGB(85, 235, 120)
+	barFill.BorderSizePixel = 0
+	barFill.Parent = barBg
+
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(1, 0)
+	fillCorner.Parent = barFill
+
+	local highlight: Highlight? = nil
+	if suite.Config.ShowHighlight then
+		local hl = Instance.new("Highlight")
+		hl.Name = "GakuranEspHighlight"
+		hl.Adornee = model
+		hl.FillColor = accent
+		hl.OutlineColor = Color3.fromRGB(255, 240, 210)
+		hl.FillTransparency = 0.74
+		hl.OutlineTransparency = 0.25
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Parent = uiRoot
+		highlight = hl
+	end
+
+	local item = {
+		billboard = billboard,
+		highlight = highlight,
+		nameLabel = nameLabel,
+		hpLabel = hpLabel,
+		barFill = barFill
+	}
+	suite.EspMap[model] = item
+	return item
+end
+
+function suite.Api.UpdateEsp()
+	if not suite.EspEnabled then
+		suite.Api.ClearAllEsp()
+		return
+	end
+
+	local _, _, lordRoot = suite.GetLordRig()
+	local targets = suite.Api.GetTargets(suite.TargetFilter)
+	local active = {} :: { [Model]: boolean }
+
+	for _, t in ipairs(targets) do
+		local dist = lordRoot and (t.root.Position - lordRoot.Position).Magnitude or 0
+		if dist <= suite.Config.EspMaxDistance then
+			active[t.model] = true
+			local item = createEsp(t.model, t.adornee, t.isPlayer)
+			local pct = math.clamp(t.humanoid.Health / t.humanoid.MaxHealth, 0, 1)
+			local tag = t.isPlayer and "PLR" or "NPC"
+
+			item.nameLabel.Text = string.format("[%s] %s (%.0fm)", tag, t.model.Name, dist)
+			item.hpLabel.Text = string.format("%.0f / %.0f HP (%.0f%%)", t.humanoid.Health, t.humanoid.MaxHealth, pct * 100)
+			item.barFill.Size = UDim2.fromScale(pct, 1)
+
+			if pct > 0.55 then
+				item.barFill.BackgroundColor3 = Color3.fromRGB(85, 235, 120)
+			elseif pct > 0.25 then
+				item.barFill.BackgroundColor3 = Color3.fromRGB(255, 205, 70)
+			else
+				item.barFill.BackgroundColor3 = Color3.fromRGB(255, 75, 75)
+			end
+		end
+	end
+
+	for model in pairs(suite.EspMap) do
+		if not active[model] then
+			removeEsp(model)
+		end
+	end
+end
+-- [05] HUD Y BUCLE: Panel de estado, botones rápidos, atajos y limpieza final
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+local suite = env.GakuranMasterSuite_v12
+if not suite then
+	return
+end
+
+local function toggleGuard()
+	suite.AutoGuardEnabled = not suite.AutoGuardEnabled
+	if not suite.AutoGuardEnabled then
+		suite.IsBlocking = false
+		suite.ParryWindowUntil = 0
+		if suite.Api.ClearShield then
+			suite.Api.ClearShield()
+		end
+		suite.LastEvent = "Guardia del Lord pausada"
+	else
+		suite.LastEvent = "Guardia del Lord activa"
+	end
+	if suite.Api.RefreshHud then
+		suite.Api.RefreshHud()
+	end
+end
+
+local function toggleEsp()
+	suite.EspEnabled = not suite.EspEnabled
+	if not suite.EspEnabled and suite.Api.ClearAllEsp then
+		suite.Api.ClearAllEsp()
+		suite.LastEvent = "ESP oculto"
+	else
+		suite.LastEvent = "ESP visible"
+		if suite.Api.UpdateEsp then
+			suite.Api.UpdateEsp()
+		end
+	end
+	if suite.Api.RefreshHud then
+		suite.Api.RefreshHud()
+	end
+end
+
+local function cycleFilter()
+	if suite.TargetFilter == "ALL" then
+		suite.TargetFilter = "PLR"
+	elseif suite.TargetFilter == "PLR" then
+		suite.TargetFilter = "NPC"
+	else
+		suite.TargetFilter = "ALL"
+	end
+	suite.LastEvent = "Filtro ESP: " .. suite.TargetFilter
+	if suite.Api.UpdateEsp then
+		suite.Api.UpdateEsp()
+	end
+	if suite.Api.RefreshHud then
+		suite.Api.RefreshHud()
+	end
+end
+
+local function makeButton(parent: Instance, name: string, pos: UDim2, text: string, bgColor: Color3, onPress: () -> ())
+	local btn = Instance.new("TextButton")
+	btn.Name = name
+	btn.Size = UDim2.fromOffset(118, 40)
+	btn.Position = pos
+	btn.BackgroundColor3 = bgColor
+	btn.BackgroundTransparency = 0.1
+	btn.BorderSizePixel = 0
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 12
+	btn.TextColor3 = Color3.fromRGB(242, 250, 255)
+	btn.Text = text
+	btn.Active = true
+	btn.Parent = parent
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = btn
+
+	suite.Track(btn.MouseButton1Click:Connect(onPress))
+	suite.Track(btn.TouchTap:Connect(onPress))
+	return btn
+end
+
+function suite.Api.RefreshHud()
+	local refs = suite.HudRefs
+	local modeLabel = refs.ModeLabel :: TextLabel?
+	local statsLabel = refs.StatsLabel :: TextLabel?
+	local cdBarFill = refs.CdBarFill :: Frame?
+	local eventLabel = refs.EventLabel :: TextLabel?
+	local guardBtn = refs.GuardBtn :: TextButton?
+	local espBtn = refs.EspBtn :: TextButton?
+	local filterBtn = refs.FilterBtn :: TextButton?
+
+	local now = os.clock()
+	local cdLeft = math.max(0, suite.CooldownUntil - now)
+	local cdPct = suite.Config.Cooldown > 0 and math.clamp(1 - (cdLeft / suite.Config.Cooldown), 0, 1) or 1
+
+	if modeLabel then
+		if not suite.AutoGuardEnabled then
+			modeLabel.Text = "LORD GUARD: PAUSADA"
+			modeLabel.TextColor3 = Color3.fromRGB(255, 115, 115)
+		elseif suite.IsBlocking then
+			modeLabel.Text = "LORD GUARD: BLOQUEANDO"
+			modeLabel.TextColor3 = Color3.fromRGB(110, 255, 190)
+		elseif cdLeft > 0 then
+			modeLabel.Text = string.format("LORD GUARD: CD %.1fs", cdLeft)
+			modeLabel.TextColor3 = Color3.fromRGB(255, 210, 95)
+		else
+			modeLabel.Text = "LORD GUARD: AUTO ACTIVA"
+			modeLabel.TextColor3 = Color3.fromRGB(120, 225, 255)
+		end
+	end
+
+	if statsLabel then
+		statsLabel.Text = string.format("Parries: %d | Bloqueos: %d", suite.ParryCount, suite.BlockCount)
+	end
+
+	if cdBarFill then
+		cdBarFill.Size = UDim2.fromScale(cdPct, 1)
+		cdBarFill.BackgroundColor3 = cdLeft > 0
+			and Color3.fromRGB(255, 195, 80)
+			or Color3.fromRGB(95, 235, 175)
+	end
+
+	if eventLabel then
+		eventLabel.Text = suite.LastEvent
+	end
+
+	if guardBtn then
+		guardBtn.Text = suite.AutoGuardEnabled and "GUARD: ON" or "GUARD: OFF"
+		guardBtn.BackgroundColor3 = suite.AutoGuardEnabled
+			and Color3.fromRGB(26, 52, 84)
+			or Color3.fromRGB(78, 30, 36)
+	end
+
+	if espBtn then
+		espBtn.Text = suite.EspEnabled and "ESP: ON" or "ESP: OFF"
+		espBtn.BackgroundColor3 = suite.EspEnabled
+			and Color3.fromRGB(28, 66, 54)
+			or Color3.fromRGB(68, 34, 38)
+	end
+
+	if filterBtn then
+		filterBtn.Text = "FILTRO: " .. suite.TargetFilter
+	end
+end
+
+local function buildHud()
+	local root = suite.GetUiRoot()
+	local prev = root:FindFirstChild("GakuranMasterSuite_Gui")
+	if prev then
+		prev:Destroy()
 	end
 
 	local gui = Instance.new("ScreenGui")
-	gui.Name = "GakuranParrySuite_Gui"
+	gui.Name = "GakuranMasterSuite_Gui"
 	gui.ResetOnSpawn = false
 	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	gui.Parent = parent
-	core.UiRefs.Gui = gui
+	gui.Parent = root
+	suite.Gui = gui
 
-	if core.Config.ShowHud then
-		local badge = Instance.new("TextLabel")
-		badge.Name = "StatusBadge"
-		badge.Size = UDim2.fromOffset(152, 28)
-		badge.Position = UDim2.new(0.5, -76, 0, 12)
-		badge.BackgroundColor3 = Color3.fromRGB(18, 24, 36)
-		badge.BackgroundTransparency = 0.18
-		badge.BorderSizePixel = 0
-		badge.Font = Enum.Font.GothamBold
-		badge.TextSize = 13
-		badge.TextColor3 = Color3.fromRGB(125, 225, 255)
-		badge.Text = "PARRY: AUTO ON"
-		badge.Parent = gui
+	local panel = Instance.new("Frame")
+	panel.Size = UDim2.fromOffset(252, 108)
+	panel.Position = UDim2.new(0, 16, 0, 16)
+	panel.BackgroundColor3 = Color3.fromRGB(15, 22, 34)
+	panel.BackgroundTransparency = 0.14
+	panel.BorderSizePixel = 0
+	panel.Parent = gui
 
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 8)
-		corner.Parent = badge
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 12)
+	corner.Parent = panel
 
-		core.UiRefs.StatusLabel = badge
-	end
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(105, 215, 255)
+	stroke.Thickness = 1.4
+	stroke.Transparency = 0.3
+	stroke.Parent = panel
 
-	if core.Config.ShowMobileButton then
-		local btn = Instance.new("TextButton")
-		btn.Name = "MobileParryButton"
-		btn.Size = UDim2.fromOffset(118, 48)
-		btn.Position = UDim2.new(1, -138, 0.62, 0)
-		btn.BackgroundColor3 = Color3.fromRGB(30, 48, 76)
-		btn.BackgroundTransparency = 0.1
-		btn.BorderSizePixel = 0
-		btn.Font = Enum.Font.GothamBold
-		btn.TextSize = 13
-		btn.TextColor3 = Color3.fromRGB(240, 248, 255)
-		btn.Text = "AUTO PARRY"
-		btn.Active = true
-		btn.Parent = gui
+	local modeLabel = Instance.new("TextLabel")
+	modeLabel.Size = UDim2.new(1, -16, 0, 22)
+	modeLabel.Position = UDim2.fromOffset(8, 6)
+	modeLabel.BackgroundTransparency = 1
+	modeLabel.Font = Enum.Font.GothamBold
+	modeLabel.TextSize = 13
+	modeLabel.TextXAlignment = Enum.TextXAlignment.Left
+	modeLabel.TextColor3 = Color3.fromRGB(120, 225, 255)
+	modeLabel.Text = "LORD GUARD: AUTO ACTIVA"
+	modeLabel.Parent = panel
 
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 12)
-		corner.Parent = btn
+	local statsLabel = Instance.new("TextLabel")
+	statsLabel.Size = UDim2.new(1, -16, 0, 18)
+	statsLabel.Position = UDim2.fromOffset(8, 28)
+	statsLabel.BackgroundTransparency = 1
+	statsLabel.Font = Enum.Font.GothamSemibold
+	statsLabel.TextSize = 11.5
+	statsLabel.TextXAlignment = Enum.TextXAlignment.Left
+	statsLabel.TextColor3 = Color3.fromRGB(225, 238, 252)
+	statsLabel.Text = "Parries: 0 | Bloqueos: 0"
+	statsLabel.Parent = panel
 
-		local stroke = Instance.new("UIStroke")
-		stroke.Color = Color3.fromRGB(115, 225, 255)
-		stroke.Thickness = 1.5
-		stroke.Transparency = 0.3
-		stroke.Parent = btn
+	local barBg = Instance.new("Frame")
+	barBg.Size = UDim2.new(1, -16, 0, 8)
+	barBg.Position = UDim2.fromOffset(8, 52)
+	barBg.BackgroundColor3 = Color3.fromRGB(34, 46, 68)
+	barBg.BorderSizePixel = 0
+	barBg.Parent = panel
 
-		core.Track(btn.MouseButton1Click:Connect(function()
-			if core.Hooks.Toggle then
-				core.Hooks.Toggle()
-			end
-		end))
+	local bgCorner = Instance.new("UICorner")
+	bgCorner.CornerRadius = UDim.new(1, 0)
+	bgCorner.Parent = barBg
 
-		core.Track(btn.TouchTap:Connect(function()
-			if core.Hooks.Toggle then
-				core.Hooks.Toggle()
-			end
-		end))
+	local barFill = Instance.new("Frame")
+	barFill.Size = UDim2.fromScale(1, 1)
+	barFill.BackgroundColor3 = Color3.fromRGB(95, 235, 175)
+	barFill.BorderSizePixel = 0
+	barFill.Parent = barBg
 
-		core.UiRefs.MobileButton = btn
-	end
+	local fillCorner = Instance.new("UICorner")
+	fillCorner.CornerRadius = UDim.new(1, 0)
+	fillCorner.Parent = barFill
+
+	local eventLabel = Instance.new("TextLabel")
+	eventLabel.Size = UDim2.new(1, -16, 0, 22)
+	eventLabel.Position = UDim2.fromOffset(8, 66)
+	eventLabel.BackgroundTransparency = 1
+	eventLabel.Font = Enum.Font.Gotham
+	eventLabel.TextSize = 11.5
+	eventLabel.TextXAlignment = Enum.TextXAlignment.Left
+	eventLabel.TextColor3 = Color3.fromRGB(185, 210, 232)
+	eventLabel.Text = suite.LastEvent
+	eventLabel.Parent = panel
+
+	suite.HudRefs.ModeLabel = modeLabel
+	suite.HudRefs.StatsLabel = statsLabel
+	suite.HudRefs.CdBarFill = barFill
+	suite.HudRefs.EventLabel = eventLabel
+	suite.HudRefs.GuardBtn = makeButton(gui, "GuardBtn", UDim2.new(1, -136, 0.54, 0), "GUARD: ON", Color3.fromRGB(26, 52, 84), toggleGuard)
+	suite.HudRefs.EspBtn = makeButton(gui, "EspBtn", UDim2.new(1, -136, 0.54, 46), "ESP: ON", Color3.fromRGB(28, 66, 54), toggleEsp)
+	suite.HudRefs.FilterBtn = makeButton(gui, "FilterBtn", UDim2.new(1, -136, 0.54, 92), "FILTRO: " .. suite.TargetFilter, Color3.fromRGB(48, 38, 76), cycleFilter)
 end
 
-pcall(function()
-	ContextActionService:BindAction(
-		"GakuranSuiteToggle",
-		function(_, state: Enum.UserInputState)
-			if state == Enum.UserInputState.Begin and core.Hooks.Toggle then
-				core.Hooks.Toggle()
-			end
-		end,
-		false,
-		core.Config.ToggleKey
-	)
-
-	ContextActionService:BindAction(
-		"GakuranSuiteManualWindow",
-		function(_, state: Enum.UserInputState)
-			if state == Enum.UserInputState.Begin and core.Hooks.ArmParry then
-				core.Hooks.ArmParry(core.Config.ParryWindow)
-			end
-		end,
-		false,
-		core.Config.ManualParryKey
-	)
-end)
-
-core.Track(UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
-	if processed then
+suite.Track(UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessed: boolean)
+	if gameProcessed then
 		return
 	end
-	if input.KeyCode == core.Config.ToggleKey and core.Hooks.Toggle then
-		core.Hooks.Toggle()
-	elseif input.KeyCode == core.Config.ManualParryKey and core.Hooks.ArmParry then
-		core.Hooks.ArmParry(core.Config.ParryWindow)
+	if input.KeyCode == suite.Config.ToggleGuardKey then
+		toggleGuard()
+	elseif input.KeyCode == suite.Config.ToggleEspKey then
+		toggleEsp()
+	elseif input.KeyCode == suite.Config.CycleFilterKey then
+		cycleFilter()
 	end
 end))
 
-local lastHudTick = 0
-core.Track(RunService.RenderStepped:Connect(function()
+local lastScan, lastEsp, lastHud = 0, 0, 0
+suite.Track(RunService.RenderStepped:Connect(function()
 	local now = os.clock()
-	if now - lastHudTick >= 0.08 then
-		lastHudTick = now
-		if core.Hooks.RefreshHud then
-			core.Hooks.RefreshHud()
+	local _, _, lordRoot = suite.GetLordRig()
+
+	if suite.IsBlocking and now > suite.BlockUntil then
+		suite.IsBlocking = false
+		if suite.Api.ClearShield then
+			suite.Api.ClearShield()
 		end
 	end
-end))
 
-if Players.LocalPlayer.Character and core.Hooks.BindCharacter then
-	task.spawn(core.Hooks.BindCharacter, Players.LocalPlayer.Character)
-end
+	if suite.IsBlocking and lordRoot and suite.Api.SyncShield then
+		suite.Api.SyncShield(lordRoot)
+	end
 
-core.Track(Players.LocalPlayer.CharacterAdded:Connect(function(char: Model)
-	if core.Hooks.BindCharacter then
-		core.Hooks.BindCharacter(char)
+	if now - lastScan >= suite.Config.ScanInterval and suite.Api.ScanAndDefendLord then
+		lastScan = now
+		suite.Api.ScanAndDefendLord()
+	end
+
+	if now - lastEsp >= suite.Config.EspInterval and suite.Api.UpdateEsp then
+		lastEsp = now
+		suite.Api.UpdateEsp()
+	end
+
+	if now - lastHud >= suite.Config.HudInterval and suite.Api.RefreshHud then
+		lastHud = now
+		suite.Api.RefreshHud()
 	end
 end))
 
-core.Destroy = function()
-	for _, conn in ipairs(core.Connections) do
+if localPlayer.Character and suite.Api.BindLord then
+	task.spawn(suite.Api.BindLord, localPlayer.Character)
+end
+suite.Track(localPlayer.CharacterAdded:Connect(function(char: Model)
+	if suite.Api.BindLord then
+		suite.Api.BindLord(char)
+	end
+end))
+
+suite.Cleanup = function()
+	for _, c in ipairs(suite.Connections) do
 		pcall(function()
-			conn:Disconnect()
+			c:Disconnect()
 		end)
 	end
-	table.clear(core.Connections)
-
-	pcall(function()
-		ContextActionService:UnbindAction("GakuranSuiteToggle")
-		ContextActionService:UnbindAction("GakuranSuiteManualWindow")
-	end)
-
-	if core.UiRefs.Gui then
+	table.clear(suite.Connections)
+	if suite.Api.ClearAllEsp then
+		suite.Api.ClearAllEsp()
+	end
+	if suite.Api.ClearShield then
+		suite.Api.ClearShield()
+	end
+	if suite.Gui then
 		pcall(function()
-			core.UiRefs.Gui:Destroy()
+			suite.Gui:Destroy()
 		end)
-		core.UiRefs.Gui = nil
+		suite.Gui = nil
 	end
 end
 
-buildUi()
-if core.Hooks.RefreshHud then
-	core.Hooks.RefreshHud()
+buildHud()
+suite.Api.RefreshHud()
+if suite.Api.UpdateEsp then
+	suite.Api.UpdateEsp()
 end
